@@ -8,7 +8,8 @@
   "images": {
   "left": "AgACAgUAAxkBAAMkZiIlWIng_sOF0iKrJbTq0uLAAF5AAL8DWsbtLFJVEe6k0SDdUAKAQADAgADbQAD0gQ",
   "right": "AgACAgUAAxKBAAMxaZipkL0_ioPB0axCWdTV15x0LjYAAqUMaxszQchUU18SzMjhwVoBAAMCAAN5AAM6BA"
-
+  },
+  
   "slot_image": {
     "11:00": "left",
     "15:00": "right",
