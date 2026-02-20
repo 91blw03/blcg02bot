@@ -2,8 +2,8 @@
   "timezone": "Asia/Ho_Chi_Minh",
   "refresh_seconds": 120,
 
-  "jitter_seconds_min": 60,
-  "jitter_seconds_max": 420,
+  "jitter_seconds_min": 0,
+  "jitter_seconds_max": 0,
 
   "images": {
   "left": "AgACAgUAAxkBAAMkaZilWIiNg_sOF0iKrJbTqOuLAAF5AAL8DWsbTLfJVEe6kOSDdUAkAQADAgADeAADOgQ",
