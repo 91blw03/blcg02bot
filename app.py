@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,62 +10,45 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-
-# -----------------------------
-# Logging
-# -----------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# -----------------------------
-# Env
-# -----------------------------
-TOKEN = os.getenv("TOKEN")          # required
-CHAT_ID = os.getenv("CHAT_ID")      # required: @channelusername OR numeric id
-TZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")  # Vietnam timezone
-CONFIG_URL = os.getenv("CONFIG_URL")      # raw GitHub URL to config.json
-PARSE_MODE = os.getenv("PARSE_MODE", "")  # optional: "HTML" or "Markdown"
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+TZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+CONFIG_URL = os.getenv("CONFIG_URL")
+PARSE_MODE = os.getenv("PARSE_MODE", "")  # "HTML" recommended
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-# Optional: send "online" and test results to admin chat (your personal chat id)
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")  # optional
-SELF_CHECK = os.getenv("SELF_CHECK", "1") == "1"  # default ON
-
-# Polling for /test command
-ENABLE_COMMANDS = os.getenv("ENABLE_COMMANDS", "1") == "1"  # default ON
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+SELF_CHECK = os.getenv("SELF_CHECK", "1") == "1"
+ENABLE_COMMANDS = os.getenv("ENABLE_COMMANDS", "1") == "1"
 
 if not TOKEN or not CHAT_ID:
     raise RuntimeError("Missing env vars: TOKEN and CHAT_ID are required.")
 
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
 
-# -----------------------------
-# Default config (fallback)
-# -----------------------------
 DEFAULT_CONFIG = {
-    "messages": {
-        "11:00": ["11点文案A", "11点文案B", "11点文案C"],
-        "15:00": ["15点文案A", "15点文案B", "15点文案C"],
-        "22:00": ["22点文案A", "22点文案B", "22点文案C"],
-    },
-    "images": {
-        "left": "",   # file_id OR https URL
-        "right": "",
-    },
-    "slot_image": {
-        "11:00": "left",
-        "15:00": "right",
-        "22:00": "left",
-    },
-    "rotation": "round_robin",   # "round_robin" or "daily"
-    "refresh_seconds": 120,      # config refresh cache
+    "timezone": "Asia/Ho_Chi_Minh",
+    "refresh_seconds": 120,
+
+    # jitter in seconds before sending on each slot (random within range)
+    "jitter_seconds_min": 0,
+    "jitter_seconds_max": 0,
+
+    # images can be string or list of strings (file_id or https url)
+    "images": {"left": "", "right": ""},
+    "slot_image": {"11:00": "left", "15:00": "right", "22:00": "left"},
+
+    # weekly schedule: mon..sun -> "11:00"/"15:00"/"22:00" -> [messages...]
+    "weekly": {}
 }
 
 _cache = {"loaded_at": 0, "data": DEFAULT_CONFIG}
 
-# round-robin state
 STATE_FILE = "state.json"
 _state = {"rr_index": 0, "last_day": ""}
 
@@ -87,7 +71,6 @@ def save_state():
 
 
 def fetch_config() -> dict:
-    """Fetch config from CONFIG_URL (raw json). Cached for refresh_seconds."""
     global _cache
     now = time.time()
     data = _cache["data"]
@@ -102,13 +85,15 @@ def fetch_config() -> dict:
     try:
         r = requests.get(CONFIG_URL, timeout=15)
         r.raise_for_status()
-        cfg = r.json()
+        cfg = r.json() or {}
 
         merged = DEFAULT_CONFIG.copy()
-        merged.update(cfg or {})
-        merged["messages"] = {**DEFAULT_CONFIG["messages"], **(cfg.get("messages") or {})}
+        merged.update(cfg)
+
+        # deep merge keys we care about
         merged["images"] = {**DEFAULT_CONFIG["images"], **(cfg.get("images") or {})}
         merged["slot_image"] = {**DEFAULT_CONFIG["slot_image"], **(cfg.get("slot_image") or {})}
+        merged["weekly"] = cfg.get("weekly") or {}
 
         _cache = {"loaded_at": now, "data": merged}
         logging.info("Config refreshed from CONFIG_URL")
@@ -119,15 +104,8 @@ def fetch_config() -> dict:
 
 
 def _post(url: str, payload: dict) -> bool:
-    """POST with retries. Returns True if success."""
     if DRY_RUN:
-        logging.info("[DRY_RUN] POST %s payload_keys=%s", url, list(payload.keys()))
-        if "text" in payload:
-            logging.info("[DRY_RUN] text:\n%s", payload["text"])
-        if "caption" in payload:
-            logging.info("[DRY_RUN] caption:\n%s", payload["caption"])
-        if "photo" in payload:
-            logging.info("[DRY_RUN] photo=%s", payload["photo"])
+        logging.info("[DRY_RUN] POST %s keys=%s", url, list(payload.keys()))
         return True
 
     for attempt in range(1, 5):
@@ -155,78 +133,94 @@ def send_text(text: str, chat_id: str | None = None) -> bool:
 
 
 def send_photo(photo_ref: str, chat_id: str | None = None) -> bool:
-    """
-    photo_ref can be:
-      - Telegram file_id
-      - http(s) URL to image
-    """
     if not photo_ref:
         logging.info("No photo configured, skip send_photo.")
         return True
-
     url = f"{API_BASE}/sendPhoto"
-    payload = {
-        "chat_id": chat_id or CHAT_ID,
-        "photo": photo_ref,
-    }
+    payload = {"chat_id": chat_id or CHAT_ID, "photo": photo_ref}
     return _post(url, payload)
 
 
-def pick_message(cfg: dict, slot_hhmm: str) -> str:
-    messages = (cfg.get("messages") or {}).get(slot_hhmm) or []
-    if not messages:
+def _weekday_key(dt: datetime) -> str:
+    # dt.weekday(): Mon=0..Sun=6
+    keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    return keys[dt.weekday()]
+
+
+def _normalize_list(x):
+    # images.left/right can be string or list
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(i) for i in x if str(i).strip()]
+    s = str(x).strip()
+    return [s] if s else []
+
+
+def pick_weekly_message(cfg: dict, slot_hhmm: str) -> str:
+    tzinfo = ZoneInfo(cfg.get("timezone", TZ))
+    now = datetime.now(tzinfo)
+    day_key = _weekday_key(now)
+
+    day_obj = (cfg.get("weekly") or {}).get(day_key) or {}
+    candidates = day_obj.get(slot_hhmm) or []
+
+    if not candidates:
         return ""
 
-    rotation = (cfg.get("rotation") or "round_robin").lower()
-    tzinfo = ZoneInfo(TZ)
-    now = datetime.now(tzinfo)
+    # round-robin across all sends (global), so it keeps changing even if some day only has 1 message
     today_key = now.strftime("%Y-%m-%d")
-
-    if rotation == "daily":
-        day_of_year = int(now.strftime("%j"))
-        slot_bias = sum(ord(c) for c in slot_hhmm) % 97
-        idx = (day_of_year + slot_bias) % len(messages)
-        return messages[idx]
-
-    # round_robin
     if _state.get("last_day") != today_key:
         _state["last_day"] = today_key
         save_state()
 
-    idx = int(_state.get("rr_index", 0)) % len(messages)
+    idx = int(_state.get("rr_index", 0)) % len(candidates)
     _state["rr_index"] = int(_state.get("rr_index", 0)) + 1
     save_state()
-    return messages[idx]
+    return candidates[idx]
+
+
+def pick_image(cfg: dict, slot_hhmm: str) -> str:
+    slot_image_key = (cfg.get("slot_image") or {}).get(slot_hhmm, "")
+    img_val = (cfg.get("images") or {}).get(slot_image_key, "")
+    pool = _normalize_list(img_val)
+    return random.choice(pool) if pool else ""
+
+
+def maybe_jitter(cfg: dict):
+    jmin = int(cfg.get("jitter_seconds_min", 0) or 0)
+    jmax = int(cfg.get("jitter_seconds_max", 0) or 0)
+    if jmax <= 0 or jmax < jmin:
+        return
+    delay = random.randint(jmin, jmax)
+    if delay > 0:
+        logging.info("Jitter delay %ss before send", delay)
+        time.sleep(delay)
 
 
 def send_slot(slot_hhmm: str, target_chat: str | None = None) -> tuple[bool, str]:
-    """
-    Sends: text first, then slot image.
-    Returns (ok, message_summary)
-    """
     cfg = fetch_config()
 
-    text = pick_message(cfg, slot_hhmm)
+    # jitter before sending
+    maybe_jitter(cfg)
+
+    text = pick_weekly_message(cfg, slot_hhmm)
     if not text:
-        return False, f"slot {slot_hhmm}: no text configured"
+        return False, f"slot {slot_hhmm}: no text configured for today"
 
-    tzinfo = ZoneInfo(TZ)
+    tzinfo = ZoneInfo(cfg.get("timezone", TZ))
     now = datetime.now(tzinfo).strftime("%Y-%m-%d %H:%M:%S")
-
-    logging.info("Run slot=%s at %s TZ=%s", slot_hhmm, now, TZ)
+    logging.info("Run slot=%s at %s TZ=%s", slot_hhmm, now, cfg.get("timezone", TZ))
 
     ok_text = send_text(text, chat_id=target_chat)
     if not ok_text:
         return False, f"slot {slot_hhmm}: send_text failed"
 
-    slot_image_key = (cfg.get("slot_image") or {}).get(slot_hhmm, "")
-    photo_ref = (cfg.get("images") or {}).get(slot_image_key, "")
-
+    photo_ref = pick_image(cfg, slot_hhmm)
     ok_photo = send_photo(photo_ref, chat_id=target_chat)
     if not ok_photo:
-        return False, f"slot {slot_hhmm}: send_photo failed (key={slot_image_key})"
-
-    return True, f"slot {slot_hhmm}: ok (photo_key={slot_image_key})"
+        return False, f"slot {slot_hhmm}: send_photo failed"
+    return True, f"slot {slot_hhmm}: ok"
 
 
 def scheduled_job(slot_hhmm: str):
@@ -237,32 +231,23 @@ def scheduled_job(slot_hhmm: str):
         logging.error(summary)
 
 
-# -----------------------------
-# Self-check (startup ping)
-# -----------------------------
 def self_check():
     if not (SELF_CHECK and ADMIN_CHAT_ID):
-        logging.info("Self-check skipped (SELF_CHECK=%s ADMIN_CHAT_ID=%s)", SELF_CHECK, bool(ADMIN_CHAT_ID))
+        logging.info("Self-check skipped.")
         return
-
-    tzinfo = ZoneInfo(TZ)
-    now = datetime.now(tzinfo).strftime("%Y-%m-%d %H:%M:%S")
     cfg = fetch_config()
+    tzinfo = ZoneInfo(cfg.get("timezone", TZ))
+    now = datetime.now(tzinfo).strftime("%Y-%m-%d %H:%M:%S")
     msg = (
         "✅ Bot online\n"
-        f"TZ: {TZ}\n"
-        f"Schedule: 11:00 / 15:00 / 22:00\n"
-        f"Rotation: {cfg.get('rotation')}\n"
+        f"TZ: {cfg.get('timezone', TZ)}\n"
+        "Schedule: 11:00 / 15:00 / 22:00\n"
         f"Time now: {now}\n"
     )
     send_text(msg, chat_id=ADMIN_CHAT_ID)
 
 
-# -----------------------------
-# Commands via long polling
-# -----------------------------
 def is_admin_user(update: dict) -> bool:
-    """Allow /test only from ADMIN_CHAT_ID if provided; otherwise allow anyone (not recommended)."""
     if not ADMIN_CHAT_ID:
         return True
     try:
@@ -272,37 +257,25 @@ def is_admin_user(update: dict) -> bool:
         return False
 
 
-def handle_command(text: str) -> tuple[str, str] | None:
-    """
-    Supported:
-      /test 11  -> trigger slot 11:00 to channel
-      /test 15  -> trigger slot 15:00 to channel
-      /test 22  -> trigger slot 22:00 to channel
-      /test me 11 -> trigger slot 11:00 to admin chat (preview)
-    """
+def handle_command(text: str):
     parts = (text or "").strip().split()
-    if not parts:
-        return None
-    if parts[0] != "/test":
+    if not parts or parts[0] != "/test":
         return None
 
-    # defaults
     target = "channel"
     slot = ""
-
     if len(parts) == 2:
         slot = parts[1]
     elif len(parts) == 3 and parts[1].lower() == "me":
         target = "me"
         slot = parts[2]
     else:
-        return None
+        return ("usage", "用法：/test 11 | /test 15 | /test 22 | /test me 11")
 
     slot_map = {"11": "11:00", "15": "15:00", "22": "22:00", "11:00": "11:00", "15:00": "15:00", "22:00": "22:00"}
     slot_hhmm = slot_map.get(slot)
     if not slot_hhmm:
         return ("usage", "用法：/test 11 | /test 15 | /test 22 | /test me 11")
-
     return (target, slot_hhmm)
 
 
@@ -313,8 +286,8 @@ def poll_commands():
 
     offset = 0
     url = f"{API_BASE}/getUpdates"
-
     logging.info("Command polling started.")
+
     while True:
         try:
             params = {"timeout": 30, "offset": offset}
@@ -327,12 +300,10 @@ def poll_commands():
 
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
-
                 msg = upd.get("message") or {}
                 text = msg.get("text") or ""
                 if not text.startswith("/"):
                     continue
-
                 if not is_admin_user(upd):
                     continue
 
@@ -341,22 +312,17 @@ def poll_commands():
                     continue
 
                 target, slot_hhmm = parsed
+                reply_chat = str(msg.get("chat", {}).get("id")) or ADMIN_CHAT_ID or CHAT_ID
+
                 if target == "usage":
-                    # reply usage to admin chat or sender
-                    chat_id = str(msg.get("chat", {}).get("id")) or ADMIN_CHAT_ID or CHAT_ID
-                    send_text(slot_hhmm, chat_id=chat_id)
+                    send_text(slot_hhmm, chat_id=reply_chat)
                     continue
 
                 if target == "me":
-                    if not ADMIN_CHAT_ID:
-                        chat_id = str(msg.get("chat", {}).get("id"))
-                    else:
-                        chat_id = ADMIN_CHAT_ID
-                    ok, summary = send_slot(slot_hhmm, target_chat=chat_id)
-                    send_text(("✅ " if ok else "❌ ") + summary, chat_id=chat_id)
+                    ok, summary = send_slot(slot_hhmm, target_chat=ADMIN_CHAT_ID or reply_chat)
+                    send_text(("✅ " if ok else "❌ ") + summary, chat_id=ADMIN_CHAT_ID or reply_chat)
                 else:
                     ok, summary = send_slot(slot_hhmm, target_chat=None)
-                    # reply result to admin
                     if ADMIN_CHAT_ID:
                         send_text(("✅ " if ok else "❌ ") + summary, chat_id=ADMIN_CHAT_ID)
 
@@ -367,23 +333,18 @@ def poll_commands():
 
 def main():
     load_state()
+    cfg = fetch_config()
+    tzinfo = ZoneInfo(cfg.get("timezone", TZ))
 
-    tzinfo = ZoneInfo(TZ)
     scheduler = BackgroundScheduler(timezone=tzinfo)
-
-    # Vietnam time daily: 11:00 / 15:00 / 22:00
     for slot in ("11:00", "15:00", "22:00"):
         hour, minute = slot.split(":")
         trigger = CronTrigger(hour=int(hour), minute=int(minute), timezone=tzinfo)
         scheduler.add_job(lambda s=slot: scheduled_job(s), trigger=trigger, id=f"slot_{slot}", replace_existing=True)
 
     scheduler.start()
-    logging.info("Scheduler started. TZ=%s CHAT_ID=%s", TZ, CHAT_ID)
-
-    # startup self-check ping
+    logging.info("Scheduler started. TZ=%s CHAT_ID=%s", cfg.get("timezone", TZ), CHAT_ID)
     self_check()
-
-    # command polling (runs in main thread)
     poll_commands()
 
 
