@@ -2,8 +2,8 @@
   "timezone": "Asia/Ho_Chi_Minh",
   "refresh_seconds": 120,
 
-  "jitter_seconds_min": 0,
-  "jitter_seconds_max": 0,
+  "jitter_seconds_min": 60,
+  "jitter_seconds_max": 420,
 
   "images": {
   "left": "AgACAgUAAxkBAANnaZkkjUfw2f4_s56eB2DBmEjrT4cAAvwNaxtMt8lUR7qQ5IN1QCQBAAMCAAN4AAM6BA",
@@ -11,7 +11,7 @@
   },
   
   "slot_image": {
-    "11:00": "left",
+    "10:46": "left",
     "15:00": "right",
     "22:00": "left"
   },
